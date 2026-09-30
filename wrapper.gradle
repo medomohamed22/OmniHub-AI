@@ -1,4 +1,0 @@
-tasks.register('wrapper', Wrapper) {
-    gradleVersion = '8.9'
-    distributionType = Wrapper.DistributionType.BIN
-}
