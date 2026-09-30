@@ -205,7 +205,7 @@ fun AiWayApp(vm: AiWayViewModel = viewModel()) {
                                 if (page == AppPage.Chat && vm.openAiModels.isNotEmpty()) {
                                     CompactModelPicker(vm)
                                 }
-                                IconButton(onClick = { vm.setDarkMode(!vm.darkMode) }) {
+                                IconButton(onClick = { vm.updateDarkMode(!vm.darkMode) }) {
                                     Icon(if (vm.darkMode) Icons.Default.LightMode else Icons.Default.DarkMode, "تبديل الوضع")
                                 }
                                 if (vm.busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
@@ -466,10 +466,10 @@ private fun ToolDialog(vm: AiWayViewModel, onDismiss: () -> Unit) {
         title = { Text("أدوات AiWay") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                ToolSwitch("قراءة ملفات المشروع", "list_files + read_file", vm.toolRead, vm::setToolRead)
-                ToolSwitch("إنشاء وتعديل الملفات", "write_file", vm.toolWrite, vm::setToolWrite)
-                ToolSwitch("حذف الملفات", "مغلق افتراضياً للأمان", vm.toolDelete, vm::setToolDelete)
-                ToolSwitch("البحث في الويب", "يخضع لدعم الموديل وسياسة الحساب", vm.toolWebSearch, vm::setToolWebSearch)
+                ToolSwitch("قراءة ملفات المشروع", "list_files + read_file", vm.toolRead, vm::updateToolRead)
+                ToolSwitch("إنشاء وتعديل الملفات", "write_file", vm.toolWrite, vm::updateToolWrite)
+                ToolSwitch("حذف الملفات", "مغلق افتراضياً للأمان", vm.toolDelete, vm::updateToolDelete)
+                ToolSwitch("البحث في الويب", "يخضع لدعم الموديل وسياسة الحساب", vm.toolWebSearch, vm::updateToolWebSearch)
             }
         },
         confirmButton = { Button(onClick = onDismiss) { Text("تم") } }
@@ -597,7 +597,7 @@ private fun SettingsScreen(vm: AiWayViewModel) {
                     Text(if (vm.darkMode) "الوضع الليلي" else "الوضع النهاري", fontWeight = FontWeight.Bold)
                     Text("تبديل فوري لكل واجهات AiWay", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Switch(checked = vm.darkMode, onCheckedChange = vm::setDarkMode)
+                Switch(checked = vm.darkMode, onCheckedChange = vm::updateDarkMode)
             }
         }
 
@@ -669,10 +669,10 @@ private fun SettingsScreen(vm: AiWayViewModel) {
         }
 
         SettingsCard("أدوات الوكيل") {
-            ToolSwitch("قراءة ملفات المشروع", "قراءة قائمة الملفات ومحتواها", vm.toolRead, vm::setToolRead)
-            ToolSwitch("إنشاء وتعديل الملفات", "السماح للوكيل بتطبيق التعديلات", vm.toolWrite, vm::setToolWrite)
-            ToolSwitch("حذف الملفات", "مغلق افتراضياً للأمان", vm.toolDelete, vm::setToolDelete)
-            ToolSwitch("البحث في الويب", "Hosted web_search عندما يدعمه الموديل والحساب", vm.toolWebSearch, vm::setToolWebSearch)
+            ToolSwitch("قراءة ملفات المشروع", "قراءة قائمة الملفات ومحتواها", vm.toolRead, vm::updateToolRead)
+            ToolSwitch("إنشاء وتعديل الملفات", "السماح للوكيل بتطبيق التعديلات", vm.toolWrite, vm::updateToolWrite)
+            ToolSwitch("حذف الملفات", "مغلق افتراضياً للأمان", vm.toolDelete, vm::updateToolDelete)
+            ToolSwitch("البحث في الويب", "Hosted web_search عندما يدعمه الموديل والحساب", vm.toolWebSearch, vm::updateToolWebSearch)
         }
     }
 }

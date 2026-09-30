@@ -176,15 +176,15 @@ class AiWayViewModel(app: Application) : AndroidViewModel(app) {
         if (slug.isBlank()) secure.remove("openai_model") else secure.put("openai_model", slug)
     }
 
-    fun setDarkMode(enabled: Boolean) {
+    fun updateDarkMode(enabled: Boolean) {
         darkMode = enabled
         secure.put("dark_mode", enabled.toString())
     }
 
-    fun setToolRead(enabled: Boolean) { toolRead = enabled; secure.put("tool_read", enabled.toString()) }
-    fun setToolWrite(enabled: Boolean) { toolWrite = enabled; secure.put("tool_write", enabled.toString()) }
-    fun setToolDelete(enabled: Boolean) { toolDelete = enabled; secure.put("tool_delete", enabled.toString()) }
-    fun setToolWebSearch(enabled: Boolean) { toolWebSearch = enabled; secure.put("tool_web_search", enabled.toString()) }
+    fun updateToolRead(enabled: Boolean) { toolRead = enabled; secure.put("tool_read", enabled.toString()) }
+    fun updateToolWrite(enabled: Boolean) { toolWrite = enabled; secure.put("tool_write", enabled.toString()) }
+    fun updateToolDelete(enabled: Boolean) { toolDelete = enabled; secure.put("tool_delete", enabled.toString()) }
+    fun updateToolWebSearch(enabled: Boolean) { toolWebSearch = enabled; secure.put("tool_web_search", enabled.toString()) }
 
     fun newChat() {
         messages.clear()
