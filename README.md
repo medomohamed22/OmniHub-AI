@@ -1,45 +1,63 @@
-# AiWay Android — Codemagic ready
+# AiWay Native Android — Direct ChatGPT / OpenAI
 
-هذا المستودع جاهز للبناء على **Codemagic** كتطبيق Android WebView لنسخة AiWay المنشورة على Vercel.
+تطبيق Android Native حقيقي مبني بـ Kotlin + Jetpack Compose. لا يستخدم WebView ولا يحتاج Backend خارجي لتسجيل ChatGPT أو تشغيل المساعد.
 
-## لماذا التطبيق يعتمد على رابط Vercel؟
-AiWay يستخدم API server-side وWebSocket وGitHub OAuth وCodex داخل `/api/*`. لذلك التطبيق يعرض النسخة المنشورة داخل WebView بدل نسخ HTML محليًا داخل APK، حتى تبقى هذه الوظائف شغالة.
+## المعمارية
 
-## الاستخدام على Codemagic
-1. ارفع **محتويات هذا المجلد كما هي** إلى مستودع GitHub، وتأكد أن `codemagic.yaml` موجود في جذر المستودع.
-2. في Codemagic اختر **Add application** ثم اربط مستودع GitHub.
-3. اختر الإعداد باستخدام `codemagic.yaml`.
-4. من **Environment variables** أضف متغيرًا باسم `APP_URL` وقيمته رابط Vercel الحقيقي، مثال: `https://your-project.vercel.app`.
-5. شغّل workflow باسم **AiWay Android APK**.
-6. بعد نجاح البناء ستجد `app-debug.apk` في قسم **Artifacts**.
-
-> يجب أن يبدأ `APP_URL` بـ `https://`.
-
-## ما تم تجهيزه لـ Codemagic؟
-- `codemagic.yaml` في جذر المستودع.
-- JDK 17.
-- Android SDK يتم ربطه تلقائيًا عبر `ANDROID_SDK_ROOT`.
-- Gradle 8.9 مثبت بشكل ثابت من خلال سكربت `gradlew`، وهو متوافق مع Android Gradle Plugin 8.7.x.
-- Cache لـ Gradle لتسريع البنايات التالية.
-- APK debug يتم حفظه تلقائيًا كـ Artifact.
-- `versionCode` يأخذ رقم Build الخاص بـ Codemagic تلقائيًا عند توفره.
-- رابط الموقع `APP_URL` يُحقن وقت البناء، فلا تحتاج لتعديل `strings.xml` في كل مرة.
-
-## البناء محليًا
-يتطلب JDK 17 وAndroid SDK ثم:
-
-```bash
-./gradlew assembleDebug
+```text
+Android App
+  ├─ Sign in with ChatGPT (OAuth Authorization Code + PKCE)
+  │    └─ loopback callback: http://127.0.0.1:<port>/auth/callback
+  ├─ Android Keystore → access / refresh / ID tokens
+  ├─ https://api.openai.com/v1/models
+  ├─ https://api.openai.com/v1/responses (store=false, stream=true)
+  │    └─ workspace tools are executed locally on the phone
+  └─ GitHub REST API directly
 ```
 
-الناتج:
+## لماذا لا يوجد Backend؟
+
+OpenAI تدعم للتطبيقات المفتوحة المصدر والمحلية تسجيلًا ديناميكيًا بـ `dynamic_agent_client`. التطبيق لا يحتاج client secret. بعد موافقة المستخدم يحصل على OAuth access token بصلاحية `chatgpt.tokens.use.direct` ويرسل الطلبات مباشرة إلى Responses API.
+
+## تسجيل ChatGPT
+
+1. افتح الإعدادات داخل التطبيق.
+2. اضغط **Continue with ChatGPT**.
+3. يفتح المتصفح الرسمي لـ OpenAI.
+4. بعد الموافقة يعيد OpenAI المتصفح إلى listener محلي على `127.0.0.1` يعمل داخل التطبيق أثناء عملية تسجيل الدخول.
+5. التطبيق يتحقق من `state` وPKCE و`nonce`، ويتحقق من توقيع `id_token` (RS256) باستخدام OpenAI JWKS.
+6. التوكنات تُخزن مشفرة بـ Android Keystore ويُستخدم refresh token تلقائيًا قبل انتهاء access token.
+
+لا يوجد API key ولا client secret داخل APK.
+
+## تشغيل المساعد
+
+- التطبيق يجلب قائمة الموديلات المتاحة للحساب من `/v1/models`.
+- يرسل طلبات إلى `/v1/responses` بـ `store=false` و`stream=true`.
+- أدوات `workspace` (list/read/write/delete) تنفذ محليًا داخل التطبيق، لذلك الموديل يعدّل ملفات المشروع الفعلية على الهاتف بدون سيرفر وسيط.
+
+## Codemagic
+
+ارفع محتويات هذا المجلد إلى جذر مستودع GitHub، ثم اربطه بـ Codemagic. لا تحتاج أي Environment Variables خاصة بـ OpenAI.
+
+Workflow:
+
+```text
+AiWay Native Direct APK
+```
+
+Artifact:
 
 ```text
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## إصدار Google Play
-الـ workflow الحالي ينتج Debug APK للاختبار والتثبيت المباشر. للنشر على Google Play يجب إضافة Android keystore في Codemagic وربطه ببناء `bundleRelease` لإخراج AAB موقّع.
+## GitHub
 
-## ملفات الموقع
-المجلد `web-source/` يحتوي نسخة من سورس الموقع للرجوع إليها، لكنه ليس الجزء الذي يتم تجميعه داخل APK. التطبيق يتصل مباشرة بعنوان `APP_URL`.
+GitHub يعمل مباشرة من التطبيق باستخدام Fine-grained Personal Access Token، ويُخزن التوكن مشفرًا بـ Android Keystore.
+
+## ملاحظات
+
+- هذا المشروع يعتمد على ميزة Sign in with ChatGPT / ChatGPT plan usage الخاصة بالتطبيقات المفتوحة المصدر والمحلية، وقد تكون خاضعة لقيود preview أو سياسات الحساب/workspace.
+- التطبيق لا يستخدم endpoints داخلية لـ ChatGPT؛ يستخدم فقط `auth.openai.com` و`api.openai.com/v1`.
+- تسجيل الخروج داخل التطبيق يمسح بيانات الاعتماد محليًا. يمكن للمستخدم أيضًا إدارة/إلغاء وصول التطبيق من إعدادات ChatGPT.
