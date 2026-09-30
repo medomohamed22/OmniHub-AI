@@ -68,81 +68,119 @@ class OpenAiAuthManager(
 
     suspend fun signIn(openBrowser: (String) -> Unit): Session = withContext(Dispatchers.IO) {
         val existing = loadSession()
-        val state = randomUrlSafe(32)
-        val nonce = randomUrlSafe(32)
-        val verifier = randomUrlSafe(64)
-        val challenge = base64Url(MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray()))
-        val listener = LoopbackListener()
-        val redirectUri = "http://127.0.0.1:${listener.port}/auth/callback"
-        val initial = existing?.clientId.isNullOrBlank()
-        val requestClientId = if (initial) "dynamic_agent_client" else existing!!.clientId
+        var retryClientId: String? = null
+        var lastInvalidGrant: Throwable? = null
 
-        val uri = Uri.parse(authEndpoint).buildUpon()
-            .appendQueryParameter("client_id", requestClientId)
-            .apply {
-                if (initial) appendQueryParameter("agent_name_hint", "AiWay")
-                appendQueryParameter("ext_agent_host_id", hostId)
-                if (!initial && !existing!!.idToken.isBlank()) appendQueryParameter("id_token_hint", existing.idToken)
-                if (!initial && existing!!.email.isNotBlank()) appendQueryParameter("login_hint", existing.email)
+        // OpenAI requires a fresh authorization attempt when an authorization-code
+        // exchange returns invalid_grant. The issued client_id from the failed
+        // registration attempt must be retained for the retry, while state, nonce,
+        // PKCE verifier/challenge and callback listener are all regenerated.
+        repeat(2) { attemptIndex ->
+            val state = randomUrlSafe(32)
+            val nonce = randomUrlSafe(32)
+            val verifier = randomUrlSafe(64)
+            val challenge = base64Url(MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray()))
+            val listener = LoopbackListener()
+            val redirectUri = "http://127.0.0.1:${listener.port}/auth/callback"
+
+            val initial = retryClientId == null && existing?.clientId.isNullOrBlank()
+            val requestClientId = retryClientId
+                ?: if (initial) "dynamic_agent_client" else existing!!.clientId
+
+            val uri = Uri.parse(authEndpoint).buildUpon()
+                .appendQueryParameter("client_id", requestClientId)
+                .apply {
+                    if (initial) appendQueryParameter("agent_name_hint", "AiWay")
+                    appendQueryParameter("ext_agent_host_id", hostId)
+                    if (!initial && existing != null && existing.idToken.isNotBlank()) {
+                        appendQueryParameter("id_token_hint", existing.idToken)
+                    }
+                    if (!initial && existing != null && existing.email.isNotBlank()) {
+                        appendQueryParameter("login_hint", existing.email)
+                    }
+                }
+                .appendQueryParameter("response_type", "code")
+                .appendQueryParameter("redirect_uri", redirectUri)
+                .appendQueryParameter("scope", "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct")
+                .appendQueryParameter("resource", resource)
+                .appendQueryParameter("state", state)
+                .appendQueryParameter("nonce", nonce)
+                .appendQueryParameter("code_challenge_method", "S256")
+                .appendQueryParameter("code_challenge", challenge)
+                .build().toString()
+
+            withContext(Dispatchers.Main) { openBrowser(uri) }
+            val callback = try {
+                withTimeout(TimeUnit.MINUTES.toMillis(10)) { listener.await() }
+            } finally {
+                listener.close()
             }
-            .appendQueryParameter("response_type", "code")
-            .appendQueryParameter("redirect_uri", redirectUri)
-            .appendQueryParameter("scope", "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct")
-            .appendQueryParameter("resource", resource)
-            .appendQueryParameter("state", state)
-            .appendQueryParameter("nonce", nonce)
-            .appendQueryParameter("code_challenge_method", "S256")
-            .appendQueryParameter("code_challenge", challenge)
-            .build().toString()
 
-        withContext(Dispatchers.Main) { openBrowser(uri) }
-        val callback = try {
-            withTimeout(TimeUnit.MINUTES.toMillis(10)) { listener.await() }
-        } finally {
-            listener.close()
-        }
-        if (callback["state"] != state) error("فشل التحقق من حالة تسجيل الدخول (state mismatch)")
-        callback["error"]?.let { error("OpenAI login: $it") }
-        val code = callback["code"].orEmpty()
-        require(code.isNotBlank()) { "لم يصل authorization code من OpenAI" }
-        val issuedClientId = if (initial) callback["client_id"].orEmpty() else existing!!.clientId
-        require(issuedClientId.isNotBlank() && issuedClientId != "dynamic_agent_client") {
-            "لم يصل client_id المسجل من OpenAI"
-        }
-        if (!initial && callback["client_id"].orEmpty().isNotBlank() && callback["client_id"] != issuedClientId) {
-            error("OpenAI returned a different client_id")
+            if (callback["state"] != state) error("فشل التحقق من حالة تسجيل الدخول (state mismatch)")
+            callback["error"]?.let { error("OpenAI login: $it") }
+            val code = callback["code"].orEmpty()
+            require(code.isNotBlank()) { "لم يصل authorization code من OpenAI" }
+
+            val issuedClientId = if (initial) callback["client_id"].orEmpty() else requestClientId
+            require(issuedClientId.isNotBlank() && issuedClientId != "dynamic_agent_client") {
+                "لم يصل client_id المسجل من OpenAI"
+            }
+            if (!initial && callback["client_id"].orEmpty().isNotBlank() && callback["client_id"] != issuedClientId) {
+                error("OpenAI returned a different client_id")
+            }
+
+            val tokenJson = try {
+                postToken(
+                    FormBody.Builder()
+                        .add("grant_type", "authorization_code")
+                        .add("client_id", issuedClientId)
+                        .add("code", code)
+                        .add("code_verifier", verifier)
+                        .add("redirect_uri", redirectUri)
+                        .add("resource", resource)
+                        .build()
+                )
+            } catch (e: OAuthException) {
+                if (e.errorCode == "invalid_grant" && attemptIndex == 0) {
+                    // Required recovery path from OpenAI docs: discard the used/invalid
+                    // code and begin a brand-new authorization with the issued client ID.
+                    retryClientId = issuedClientId
+                    lastInvalidGrant = e
+                    return@repeat
+                }
+                throw e
+            }
+
+            val idToken = tokenJson.optString("id_token")
+            require(idToken.isNotBlank()) { "Token response did not include id_token" }
+            val claims = validateIdToken(idToken, issuedClientId, nonce)
+            val scopes = tokenJson.optString("scope").split(' ').filter { it.isNotBlank() }.toSet()
+            require("chatgpt.tokens.use.direct" in scopes) {
+                "لم يتم منح صلاحية استخدام خطة ChatGPT للتطبيق"
+            }
+
+            val session = Session(
+                clientId = issuedClientId,
+                accessToken = tokenJson.optString("access_token"),
+                refreshToken = tokenJson.optString("refresh_token"),
+                idToken = idToken,
+                email = claims.optString("email"),
+                subject = claims.optString("sub"),
+                scopes = scopes,
+                expiresAtMs = System.currentTimeMillis() + tokenJson.optLong("expires_in", 3600) * 1000L
+            )
+            require(session.accessToken.isNotBlank()) { "Token response did not include access_token" }
+
+            // For a returning account, do not silently replace it with another identity.
+            if (existing != null && existing.subject.isNotBlank() && session.subject != existing.subject) {
+                error("تم اختيار حساب ChatGPT مختلف. سجل الخروج أولاً لإضافة حساب آخر")
+            }
+
+            saveSession(session)
+            return@withContext session
         }
 
-        val tokenJson = postToken(
-            FormBody.Builder()
-                .add("grant_type", "authorization_code")
-                .add("client_id", issuedClientId)
-                .add("code", code)
-                .add("code_verifier", verifier)
-                .add("redirect_uri", redirectUri)
-                .add("resource", resource)
-                .build()
-        )
-        val idToken = tokenJson.optString("id_token")
-        require(idToken.isNotBlank()) { "Token response did not include id_token" }
-        val claims = validateIdToken(idToken, issuedClientId, nonce)
-        val scopes = tokenJson.optString("scope").split(' ').filter { it.isNotBlank() }.toSet()
-        require("chatgpt.tokens.use.direct" in scopes) {
-            "لم يتم منح صلاحية استخدام خطة ChatGPT للتطبيق"
-        }
-        val session = Session(
-            clientId = issuedClientId,
-            accessToken = tokenJson.optString("access_token"),
-            refreshToken = tokenJson.optString("refresh_token"),
-            idToken = idToken,
-            email = claims.optString("email"),
-            subject = claims.optString("sub"),
-            scopes = scopes,
-            expiresAtMs = System.currentTimeMillis() + tokenJson.optLong("expires_in", 3600) * 1000L
-        )
-        require(session.accessToken.isNotBlank()) { "Token response did not include access_token" }
-        saveSession(session)
-        session
+        throw (lastInvalidGrant ?: IllegalStateException("تعذر إكمال تسجيل الدخول إلى ChatGPT. حاول مرة أخرى"))
     }
 
     suspend fun validAccessToken(): String = withContext(Dispatchers.IO) {
@@ -181,16 +219,20 @@ class OpenAiAuthManager(
         secure.remove("openai_session")
     }
 
+    private class OAuthException(val errorCode: String, description: String) :
+        IllegalStateException("OpenAI OAuth: ${description.ifBlank { errorCode }}")
+
     private fun postToken(body: FormBody): JSONObject {
         val req = Request.Builder().url(tokenEndpoint).post(body).header("Accept", "application/json").build()
         http.newCall(req).execute().use { response ->
             val text = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 val obj = runCatching { JSONObject(text) }.getOrNull()
+                val code = obj?.optString("error").orEmpty().ifBlank { "http_${response.code}" }
                 val msg = obj?.optString("error_description").takeUnless { it.isNullOrBlank() }
                     ?: obj?.optString("error").takeUnless { it.isNullOrBlank() }
                     ?: "HTTP ${response.code}"
-                error("OpenAI OAuth: $msg")
+                throw OAuthException(code, msg)
             }
             return JSONObject(text)
         }
