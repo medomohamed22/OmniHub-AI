@@ -279,31 +279,71 @@ class OpenAiAuthManager(
     private fun base64Url(data: ByteArray): String = Base64.encodeToString(data, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
 
     private class LoopbackListener {
-        private val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        private val server: ServerSocket = openServer()
         val port: Int get() = server.localPort
         private val result = CompletableDeferred<Map<String, String>>()
+
         private val worker = Thread {
-            runCatching {
-                server.accept().use { socket ->
-                    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-                    val first = reader.readLine().orEmpty()
-                    val target = first.split(' ').getOrNull(1).orEmpty()
-                    val uri = Uri.parse("http://127.0.0.1$target")
-                    val params = linkedMapOf<String, String>()
-                    uri.queryParameterNames.forEach { name -> params[name] = uri.getQueryParameter(name).orEmpty() }
-                    val ok = target.startsWith("/auth/callback")
-                    val body = if (ok) {
-                        "<html><body style='font-family:sans-serif;padding:32px'><h2>AiWay</h2><p>تم تسجيل الدخول. يمكنك العودة إلى التطبيق.</p></body></html>"
-                    } else "<html><body>Invalid callback.</body></html>"
-                    val out = OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8)
-                    out.write("HTTP/1.1 ${if (ok) "200 OK" else "404 Not Found"}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${body.toByteArray().size}\r\nConnection: close\r\n\r\n$body")
-                    out.flush()
-                    if (ok) result.complete(params) else result.completeExceptionally(IllegalStateException("Invalid OAuth callback path"))
+            try {
+                while (!result.isCompleted && !server.isClosed) {
+                    val socket = server.accept()
+                    socket.soTimeout = 5_000
+                    socket.use {
+                        val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+                        val first = reader.readLine().orEmpty()
+                        val target = first.split(' ').getOrNull(1).orEmpty()
+                        // Drain request headers so Chromium does not keep the request pending.
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isBlank()) break
+                        }
+
+                        val uri = runCatching { Uri.parse("http://127.0.0.1$target") }.getOrNull()
+                        val isCallback = uri?.path == "/auth/callback"
+                        val params = linkedMapOf<String, String>()
+                        if (isCallback && uri != null) {
+                            uri.queryParameterNames.forEach { name ->
+                                params[name] = uri.getQueryParameter(name).orEmpty()
+                            }
+                        }
+
+                        val body = if (isCallback) {
+                            """<!doctype html><html dir='rtl'><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta charset='utf-8'><title>AiWay</title></head><body style='margin:0;background:#f7f9ff;font-family:Arial,sans-serif;color:#172033;display:flex;min-height:100vh;align-items:center;justify-content:center'><div style='max-width:420px;padding:28px;text-align:center'><div style='width:72px;height:72px;border-radius:22px;background:#2f6fed;color:white;margin:0 auto 18px;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700'>A</div><h2>تم ربط ChatGPT بـ AiWay</h2><p style='color:#667085;line-height:1.7'>تم استلام تسجيل الدخول بنجاح. سيتم الرجوع إلى تطبيق AiWay تلقائياً.</p><p><a href='aiway://oauth-complete' style='display:inline-block;background:#2f6fed;color:white;padding:12px 22px;border-radius:14px;text-decoration:none'>العودة إلى AiWay</a></p><script>setTimeout(function(){location.href='aiway://oauth-complete'},700)</script></div></body></html>"""
+                        } else {
+                            """<!doctype html><html><body>AiWay OAuth listener is running.</body></html>"""
+                        }
+                        val bytes = body.toByteArray(Charsets.UTF_8)
+                        val out = socket.getOutputStream()
+                        val status = if (isCallback) "200 OK" else "204 No Content"
+                        out.write(("HTTP/1.1 $status\r\n" +
+                            "Content-Type: text/html; charset=utf-8\r\n" +
+                            "Cache-Control: no-store\r\n" +
+                            "Content-Length: ${bytes.size}\r\n" +
+                            "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII))
+                        if (isCallback) out.write(bytes)
+                        out.flush()
+
+                        if (isCallback) result.complete(params)
+                    }
                 }
-            }.onFailure { if (!result.isCompleted) result.completeExceptionally(it) }
-        }.apply { isDaemon = true; name = "aiway-oauth-loopback"; start() }
+            } catch (t: Throwable) {
+                if (!result.isCompleted && !server.isClosed) result.completeExceptionally(t)
+            }
+        }.apply {
+            isDaemon = true
+            name = "aiway-oauth-loopback"
+            start()
+        }
 
         suspend fun await(): Map<String, String> = result.await()
         fun close() { runCatching { server.close() } }
+
+        companion object {
+            private fun openServer(): ServerSocket {
+                // Prefer the documented example port on mobile; fall back to an ephemeral port if occupied.
+                return runCatching { ServerSocket(1455, 16, InetAddress.getByName("127.0.0.1")) }
+                    .getOrElse { ServerSocket(0, 16, InetAddress.getByName("127.0.0.1")) }
+            }
+        }
     }
 }

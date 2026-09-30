@@ -6,14 +6,18 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okio.BufferedSource
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 class OpenAiDirectClient(private val http: OkHttpClient) {
     data class Model(val slug: String, val displayName: String)
     data class AgentResult(val finalText: String, val changed: Boolean)
+    data class ToolOptions(
+        val allowRead: Boolean = true,
+        val allowWrite: Boolean = true,
+        val allowDelete: Boolean = false,
+        val webSearch: Boolean = false
+    )
 
     private val jsonType = "application/json; charset=utf-8".toMediaType()
 
@@ -43,14 +47,22 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
         model: String,
         files: MutableMap<String, String>,
         prompt: String,
+        tools: ToolOptions,
         onTextDelta: (String) -> Unit = {},
         onTool: (String) -> Unit = {}
     ): AgentResult = withContext(Dispatchers.IO) {
         require(model.isNotBlank()) { "اختر موديل أولاً" }
+        val toolDescription = buildList {
+            if (tools.allowRead) add("قراءة الملفات")
+            if (tools.allowWrite) add("إنشاء/تعديل الملفات")
+            if (tools.allowDelete) add("حذف الملفات")
+            if (tools.webSearch) add("البحث في الويب")
+        }.joinToString("، ").ifBlank { "بدون أدوات" }
+
         val input = JSONArray().put(
             JSONObject()
                 .put("role", "user")
-                .put("content", "طلب المستخدم:\n$prompt\n\nمساحة العمل الحالية تحتوي ${files.size} ملف. استخدم أدوات workspace لقراءة الملفات اللازمة وتعديلها فعلياً. لا تفترض محتوى ملف قبل قراءته.")
+                .put("content", "طلب المستخدم:\n$prompt\n\nمساحة العمل الحالية تحتوي ${files.size} ملف. الأدوات المسموح بها: $toolDescription. لا تفترض محتوى ملف قبل قراءته.")
         )
         var changed = false
         var finalText = ""
@@ -58,16 +70,18 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
         repeat(12) { round ->
             val payload = JSONObject()
                 .put("model", model)
-                .put("instructions", "أنت وكيل برمجة داخل تطبيق Android اسمه AiWay. نفّذ طلب المستخدم على مساحة العمل المحلية باستخدام أدوات workspace. اقرأ قبل التعديل، غيّر أقل قدر لازم، حافظ على قابلية البناء، ولا تحذف ملفات إلا عند الحاجة. بعد الانتهاء اشرح باختصار ما فعلته بالعربية.")
+                .put("instructions", "أنت AiWay، وكيل برمجة داخل تطبيق Android Native. نفّذ طلب المستخدم بدقة. استخدم أدوات workspace فقط حسب الصلاحيات المتاحة، اقرأ قبل التعديل، غيّر أقل قدر لازم، حافظ على قابلية البناء، ولا تحذف ملفات إلا عند الحاجة ومع وجود أداة الحذف. بعد الانتهاء اشرح باختصار ما فعلته بالعربية.")
                 .put("input", input)
-                .put("tools", workspaceTools())
                 .put("parallel_tool_calls", false)
                 .put("store", false)
                 .put("stream", true)
 
+            val availableTools = toolsJson(tools)
+            if (availableTools.length() > 0) payload.put("tools", availableTools)
+
             val response = streamResponse(accessToken, payload, onTextDelta)
-            // Keep every output item (including reasoning items) as required for tool-call continuations.
             for (i in 0 until response.output.length()) input.put(response.output.get(i))
+
             val calls = mutableListOf<JSONObject>()
             for (i in 0 until response.output.length()) {
                 val item = response.output.optJSONObject(i) ?: continue
@@ -83,11 +97,13 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
                 val name = rawName.substringAfterLast('.')
                 val args = runCatching { JSONObject(call.optString("arguments", "{}")) }.getOrElse { JSONObject() }
                 onTool(name)
-                val result = executeWorkspaceTool(name, args, files) { changed = true }
-                input.put(JSONObject()
-                    .put("type", "function_call_output")
-                    .put("call_id", call.getString("call_id"))
-                    .put("output", result))
+                val result = executeWorkspaceTool(name, args, files, tools) { changed = true }
+                input.put(
+                    JSONObject()
+                        .put("type", "function_call_output")
+                        .put("call_id", call.getString("call_id"))
+                        .put("output", result)
+                )
             }
             if (round == 11) error("وصل الوكيل للحد الأقصى من خطوات الأدوات")
         }
@@ -138,11 +154,15 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
         }
     }
 
-    private fun workspaceTools(): JSONArray {
+    private fun toolsJson(options: ToolOptions): JSONArray {
+        val all = JSONArray()
+        val workspaceTools = JSONArray()
+
         fun noArgs(name: String, description: String) = JSONObject()
             .put("type", "function").put("name", name).put("description", description)
             .put("parameters", JSONObject().put("type", "object").put("properties", JSONObject()).put("required", JSONArray()).put("additionalProperties", false))
             .put("strict", true)
+
         fun oneString(name: String, description: String, field: String, fieldDescription: String) = JSONObject()
             .put("type", "function").put("name", name).put("description", description)
             .put("parameters", JSONObject().put("type", "object")
@@ -150,46 +170,63 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
                 .put("required", JSONArray().put(field)).put("additionalProperties", false))
             .put("strict", true)
 
-        val write = JSONObject()
-            .put("type", "function").put("name", "write_file")
-            .put("description", "Create or replace a UTF-8 text file in the current workspace.")
-            .put("parameters", JSONObject().put("type", "object")
-                .put("properties", JSONObject()
-                    .put("path", JSONObject().put("type", "string").put("description", "Relative workspace path"))
-                    .put("content", JSONObject().put("type", "string").put("description", "Complete new file contents")))
-                .put("required", JSONArray().put("path").put("content")).put("additionalProperties", false))
-            .put("strict", true)
-
-        val namespace = JSONObject()
-            .put("type", "namespace")
-            .put("name", "workspace")
-            .put("description", "Read and edit the user's local text-code workspace on the Android device.")
-            .put("tools", JSONArray()
-                .put(noArgs("list_files", "List every file path and UTF-8 character count in the workspace."))
-                .put(oneString("read_file", "Read one text file from the workspace.", "path", "Relative workspace path"))
-                .put(write)
-                .put(oneString("delete_file", "Delete one file from the workspace.", "path", "Relative workspace path")))
-        return JSONArray().put(namespace)
+        if (options.allowRead) {
+            workspaceTools.put(noArgs("list_files", "List every file path and UTF-8 character count in the workspace."))
+            workspaceTools.put(oneString("read_file", "Read one UTF-8 text file from the workspace.", "path", "Relative workspace path"))
+        }
+        if (options.allowWrite) {
+            workspaceTools.put(
+                JSONObject()
+                    .put("type", "function").put("name", "write_file")
+                    .put("description", "Create or replace a UTF-8 text file in the current workspace.")
+                    .put("parameters", JSONObject().put("type", "object")
+                        .put("properties", JSONObject()
+                            .put("path", JSONObject().put("type", "string").put("description", "Relative workspace path"))
+                            .put("content", JSONObject().put("type", "string").put("description", "Complete new file contents")))
+                        .put("required", JSONArray().put("path").put("content")).put("additionalProperties", false))
+                    .put("strict", true)
+            )
+        }
+        if (options.allowDelete) {
+            workspaceTools.put(oneString("delete_file", "Delete one file from the workspace.", "path", "Relative workspace path"))
+        }
+        if (workspaceTools.length() > 0) {
+            all.put(
+                JSONObject()
+                    .put("type", "namespace")
+                    .put("name", "workspace")
+                    .put("description", "Read and edit the user's local text-code workspace on the Android device.")
+                    .put("tools", workspaceTools)
+            )
+        }
+        if (options.webSearch) all.put(JSONObject().put("type", "web_search"))
+        return all
     }
 
-    private fun executeWorkspaceTool(name: String, args: JSONObject, files: MutableMap<String, String>, markChanged: () -> Unit): String {
+    private fun executeWorkspaceTool(
+        name: String,
+        args: JSONObject,
+        files: MutableMap<String, String>,
+        options: ToolOptions,
+        markChanged: () -> Unit
+    ): String {
         fun path(): String {
             val p = args.optString("path").trim().replace('\\', '/')
             require(p.isNotBlank() && !p.startsWith('/') && !p.split('/').contains("..")) { "Invalid workspace path" }
             return p
         }
         return when (name) {
-            "list_files" -> JSONArray(files.entries.sortedBy { it.key }.map { JSONObject().put("path", it.key).put("characters", it.value.length) }).toString()
-            "read_file" -> {
+            "list_files" -> if (!options.allowRead) denied(name) else JSONArray(files.entries.sortedBy { it.key }.map { JSONObject().put("path", it.key).put("characters", it.value.length) }).toString()
+            "read_file" -> if (!options.allowRead) denied(name) else {
                 val p = path(); val content = files[p] ?: return JSONObject().put("ok", false).put("error", "not_found").put("path", p).toString()
                 JSONObject().put("ok", true).put("path", p).put("content", content).toString()
             }
-            "write_file" -> {
+            "write_file" -> if (!options.allowWrite) denied(name) else {
                 val p = path(); val content = args.getString("content")
                 if (files[p] != content) { files[p] = content; markChanged() }
                 JSONObject().put("ok", true).put("path", p).put("characters", content.length).toString()
             }
-            "delete_file" -> {
+            "delete_file" -> if (!options.allowDelete) denied(name) else {
                 val p = path(); val existed = files.remove(p) != null
                 if (existed) markChanged()
                 JSONObject().put("ok", true).put("path", p).put("deleted", existed).toString()
@@ -198,11 +235,16 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
         }
     }
 
+    private fun denied(name: String) = JSONObject().put("ok", false).put("error", "tool_disabled").put("name", name).toString()
+
     private fun apiError(code: Int, body: String): String {
         val obj = runCatching { JSONObject(body) }.getOrNull()
         val error = obj?.optJSONObject("error")
+        val errorCode = error?.optString("code").orEmpty()
+        if (errorCode == "subscription_sharing_usage_limit_exceeded") return "وصلت إلى حد استخدام خطة ChatGPT. افتح الإعدادات ← الاستخدام لمعرفة موعد إعادة التعيين."
+        if (errorCode == "subscription_sharing_usage_unavailable") return "استخدام خطة ChatGPT غير متاح حالياً لهذا الطلب أو الحساب."
         return error?.optString("message").takeUnless { it.isNullOrBlank() }
-            ?: error?.optString("code").takeUnless { it.isNullOrBlank() }
+            ?: errorCode.takeUnless { it.isBlank() }
             ?: "OpenAI HTTP $code"
     }
 }

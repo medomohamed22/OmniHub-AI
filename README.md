@@ -1,63 +1,41 @@
-# AiWay Native Android — Direct ChatGPT / OpenAI
+# AiWay Native Android 1.2
 
-تطبيق Android Native حقيقي مبني بـ Kotlin + Jetpack Compose. لا يستخدم WebView ولا يحتاج Backend خارجي لتسجيل ChatGPT أو تشغيل المساعد.
+تطبيق Android Native بالكامل باستخدام Kotlin + Jetpack Compose، بدون WebView وبدون Backend خارجي لتسجيل ChatGPT.
 
-## المعمارية
+## الجديد في 1.2
 
-```text
-Android App
-  ├─ Sign in with ChatGPT (OAuth Authorization Code + PKCE)
-  │    └─ loopback callback: http://127.0.0.1:<port>/auth/callback
-  ├─ Android Keystore → access / refresh / ID tokens
-  ├─ https://api.openai.com/v1/models
-  ├─ https://api.openai.com/v1/responses (store=false, stream=true)
-  │    └─ workspace tools are executed locally on the phone
-  └─ GitHub REST API directly
-```
+- تحسين تسجيل **Continue with ChatGPT** عبر OAuth + PKCE بالطريقة الرسمية لتطبيقات open-source/local.
+- callback محلي على `127.0.0.1` مع listener يتحمل اتصالات Chromium الإضافية، ويفضل المنفذ `1455` ثم يستخدم منفذاً متاحاً عند الحاجة.
+- بعد نجاح callback، صفحة محلية تؤكد النجاح وتحاول إعادة فتح AiWay تلقائياً عبر `aiway://oauth-complete`.
+- استخدام Android Custom Tabs بدلاً من WebView لصفحة OpenAI الرسمية.
+- اختيار موديل من الموديلات المتاحة فعلياً للحساب عبر `/v1/models`.
+- أدوات قابلة للتفعيل/الإيقاف: قراءة الملفات، كتابة/إنشاء الملفات، حذف الملفات، والبحث في الويب عندما يدعمه الموديل والحساب.
+- Light / Dark mode مع زر تبديل وحفظ الاختيار محلياً.
+- إعادة تصميم الواجهة بأسلوب AiWay: أزرق/أبيض، بطاقات مستديرة، قائمة جانبية، شاشة ترحيب، ومحرر محادثة حديث.
+- صفحة Usage داخل الإعدادات تربط إلى `https://chatgpt.com/settings/usage` لعرض الحصة الرسمية وإعادة التعيين.
 
-## لماذا لا يوجد Backend؟
+## لماذا لا يعرض التطبيق نسبة 5 ساعات/الأسبوع كرقم داخلي؟
 
-OpenAI تدعم للتطبيقات المفتوحة المصدر والمحلية تسجيلًا ديناميكيًا بـ `dynamic_agent_client`. التطبيق لا يحتاج client secret. بعد موافقة المستخدم يحصل على OAuth access token بصلاحية `chatgpt.tokens.use.direct` ويرسل الطلبات مباشرة إلى Responses API.
+توثيق Sign in with ChatGPT الحالي يوجّه تطبيقات open-source إلى ChatGPT Settings → Usage لمراجعة الاستهلاك وإدارة حدود التطبيق. لا يوجد endpoint موثق في هذا المسار يعيد النسبة الدقيقة لنافذة 5 ساعات أو الأسبوع أو الـreset، لذلك AiWay لا يخمّن أرقاماً غير موثوقة ويعطي رابط الصفحة الرسمية.
+
+## البناء على Codemagic
+
+1. ارفع محتويات هذا المجلد إلى جذر مستودع GitHub.
+2. أضف التطبيق إلى Codemagic.
+3. اختر `codemagic.yaml`.
+4. شغّل workflow: **AiWay Native Direct APK**.
+5. حمّل APK من Artifacts.
+
+لا تحتاج `BACKEND_URL` أو OpenAI API key أو client secret.
 
 ## تسجيل ChatGPT
 
-1. افتح الإعدادات داخل التطبيق.
-2. اضغط **Continue with ChatGPT**.
-3. يفتح المتصفح الرسمي لـ OpenAI.
-4. بعد الموافقة يعيد OpenAI المتصفح إلى listener محلي على `127.0.0.1` يعمل داخل التطبيق أثناء عملية تسجيل الدخول.
-5. التطبيق يتحقق من `state` وPKCE و`nonce`، ويتحقق من توقيع `id_token` (RS256) باستخدام OpenAI JWKS.
-6. التوكنات تُخزن مشفرة بـ Android Keystore ويُستخدم refresh token تلقائيًا قبل انتهاء access token.
+من داخل التطبيق: الإعدادات والموديل → Continue with ChatGPT. ستفتح صفحة OpenAI الرسمية في Custom Tab. بعد الموافقة سيعيد OpenAI التوجيه إلى HTTP loopback على `127.0.0.1`. عندما ترى رسالة نجاح، AiWay يحاول الرجوع للتطبيق تلقائياً ويكمل token exchange والتحقق ثم يجلب الموديلات.
 
-لا يوجد API key ولا client secret داخل APK.
+## أمان
 
-## تشغيل المساعد
-
-- التطبيق يجلب قائمة الموديلات المتاحة للحساب من `/v1/models`.
-- يرسل طلبات إلى `/v1/responses` بـ `store=false` و`stream=true`.
-- أدوات `workspace` (list/read/write/delete) تنفذ محليًا داخل التطبيق، لذلك الموديل يعدّل ملفات المشروع الفعلية على الهاتف بدون سيرفر وسيط.
-
-## Codemagic
-
-ارفع محتويات هذا المجلد إلى جذر مستودع GitHub، ثم اربطه بـ Codemagic. لا تحتاج أي Environment Variables خاصة بـ OpenAI.
-
-Workflow:
-
-```text
-AiWay Native Direct APK
-```
-
-Artifact:
-
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
-
-## GitHub
-
-GitHub يعمل مباشرة من التطبيق باستخدام Fine-grained Personal Access Token، ويُخزن التوكن مشفرًا بـ Android Keystore.
-
-## ملاحظات
-
-- هذا المشروع يعتمد على ميزة Sign in with ChatGPT / ChatGPT plan usage الخاصة بالتطبيقات المفتوحة المصدر والمحلية، وقد تكون خاضعة لقيود preview أو سياسات الحساب/workspace.
-- التطبيق لا يستخدم endpoints داخلية لـ ChatGPT؛ يستخدم فقط `auth.openai.com` و`api.openai.com/v1`.
-- تسجيل الخروج داخل التطبيق يمسح بيانات الاعتماد محليًا. يمكن للمستخدم أيضًا إدارة/إلغاء وصول التطبيق من إعدادات ChatGPT.
+- OAuth Authorization Code + PKCE.
+- لا يوجد client secret داخل APK.
+- access/refresh/id tokens تحفظ مشفرة بمفتاح Android Keystore.
+- Responses API يستخدم `store=false` و`stream=true`.
+- حذف الملفات أداة مغلقة افتراضياً.

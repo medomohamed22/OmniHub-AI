@@ -40,6 +40,11 @@ class AiWayViewModel(app: Application) : AndroidViewModel(app) {
     var openAiStatus by mutableStateOf(if (openAiAuth.currentSession() != null) "مسجل الدخول" else "غير مسجل")
     var selectedModel by mutableStateOf(secure.get("openai_model"))
     var agentActivity by mutableStateOf("")
+    var darkMode by mutableStateOf(secure.get("dark_mode") == "true")
+    var toolRead by mutableStateOf(secure.get("tool_read").let { it.isBlank() || it == "true" })
+    var toolWrite by mutableStateOf(secure.get("tool_write").let { it.isBlank() || it == "true" })
+    var toolDelete by mutableStateOf(secure.get("tool_delete") == "true")
+    var toolWebSearch by mutableStateOf(secure.get("tool_web_search") == "true")
     var busy by mutableStateOf(false)
     var notice by mutableStateOf<String?>(null)
 
@@ -171,6 +176,21 @@ class AiWayViewModel(app: Application) : AndroidViewModel(app) {
         if (slug.isBlank()) secure.remove("openai_model") else secure.put("openai_model", slug)
     }
 
+    fun setDarkMode(enabled: Boolean) {
+        darkMode = enabled
+        secure.put("dark_mode", enabled.toString())
+    }
+
+    fun setToolRead(enabled: Boolean) { toolRead = enabled; secure.put("tool_read", enabled.toString()) }
+    fun setToolWrite(enabled: Boolean) { toolWrite = enabled; secure.put("tool_write", enabled.toString()) }
+    fun setToolDelete(enabled: Boolean) { toolDelete = enabled; secure.put("tool_delete", enabled.toString()) }
+    fun setToolWebSearch(enabled: Boolean) { toolWebSearch = enabled; secure.put("tool_web_search", enabled.toString()) }
+
+    fun newChat() {
+        messages.clear()
+        agentActivity = ""
+    }
+
     fun sendPrompt(prompt: String) = viewModelScope.launch {
         val text = prompt.trim()
         if (text.isBlank()) return@launch
@@ -189,6 +209,12 @@ class AiWayViewModel(app: Application) : AndroidViewModel(app) {
                 model = selectedModel,
                 files = workspace,
                 prompt = text,
+                tools = OpenAiDirectClient.ToolOptions(
+                    allowRead = toolRead,
+                    allowWrite = toolWrite,
+                    allowDelete = toolDelete,
+                    webSearch = toolWebSearch
+                ),
                 onTextDelta = { delta ->
                     viewModelScope.launch {
                         val idx = messages.indexOfLast { it.role == "assistant" }
