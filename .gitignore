@@ -1,0 +1,10 @@
+.gradle/
+.idea/
+local.properties
+**/build/
+*.iml
+.DS_Store
+
+# Keep Codemagic/Gradle launcher tracked
+!gradlew
+!gradle/wrapper/gradle-wrapper.properties

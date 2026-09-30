@@ -1,0 +1,32 @@
+workflows:
+  android-debug-apk:
+    name: AiWay Android APK
+    max_build_duration: 60
+    environment:
+      java: 17
+    cache:
+      cache_paths:
+        - $HOME/.gradle/caches
+        - $HOME/.gradle/wrapper
+    scripts:
+      - name: Validate configuration
+        script: |
+          set -e
+          if [ -z "$APP_URL" ]; then
+            echo "APP_URL is not set in Codemagic. The fallback URL in the project will be used."
+          else
+            case "$APP_URL" in
+              https://*) echo "Using APP_URL=$APP_URL" ;;
+              *) echo "APP_URL must start with https://"; exit 1 ;;
+            esac
+          fi
+      - name: Set Android SDK location
+        script: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > "$CM_BUILD_DIR/local.properties"
+      - name: Build debug APK
+        script: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon clean assembleDebug
+    artifacts:
+      - app/build/outputs/apk/debug/*.apk
+      - app/build/outputs/logs/**
