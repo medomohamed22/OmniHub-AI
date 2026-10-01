@@ -35,7 +35,7 @@ class SecureStore(context: Context) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val raw = cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8))
-        prefs.edit().putString(name, Base64.encodeToString(raw, Base64.NO_WRAP)).apply()
+        prefs.edit().putString(name, Base64.encodeToString(raw, Base64.NO_WRAP)).commit()
     }
 
     fun get(name: String): String {

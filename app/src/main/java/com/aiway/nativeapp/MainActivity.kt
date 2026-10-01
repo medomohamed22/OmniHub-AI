@@ -3,7 +3,42 @@ package com.aiway.nativeapp
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.annotation.SuppressLint
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Undo
+import androidx.compose.material3.FilterChip
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.activity.ComponentActivity
+import androidx.activity.viewModels
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.NetworkCheck
+import androidx.compose.material.icons.filled.Storage
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.browser.customtabs.CustomTabsIntent
@@ -106,15 +141,33 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+    private val vm: AiWayViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        setContent { AiWayApp() }
+        setContent { AiWayApp(vm) }
+    }
+
+    override fun onStop() {
+        // Persist chat + workspace synchronously so nothing is lost if Android kills the process.
+        runCatching { vm.flush() }
+        super.onStop()
+    }
+}
+
+private fun relTime(ts: Long): String {
+    val m = (System.currentTimeMillis() - ts) / 60000
+    return when {
+        m < 1 -> "الآن"
+        m < 60 -> "منذ $m د"
+        m < 1440 -> "منذ ${m / 60} س"
+        else -> "منذ ${m / 1440} يوم"
     }
 }
 
 enum class AppPage(val label: String) {
-    Chat("محادثة جديدة"), Files("مساحة العمل"), Github("GitHub"), Settings("الإعدادات والموديل")
+    Chat("محادثة جديدة"), Files("مساحة العمل"), Preview("المعاينة"), Github("GitHub"), Settings("الإعدادات والموديل")
 }
 
 private val AiBlue = Color(0xFF2F6FED)
@@ -180,6 +233,11 @@ fun AiWayApp(vm: AiWayViewModel = viewModel()) {
                             vm.newChat()
                             page = AppPage.Chat
                             scope.launch { drawer.close() }
+                        },
+                        onOpen = { id ->
+                            vm.openConversation(id)
+                            page = AppPage.Chat
+                            scope.launch { drawer.close() }
                         }
                     )
                 }
@@ -198,7 +256,15 @@ fun AiWayApp(vm: AiWayViewModel = viewModel()) {
                             },
                             title = {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(page.label, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                                    Box(
+                                        Modifier.size(9.dp).clip(CircleShape)
+                                            .background(if (vm.openAiAccount.isNotBlank()) Color(0xFF22C55E) else Color(0xFFF59E0B))
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    val title = if (page == AppPage.Chat) {
+                                        vm.conversations.firstOrNull { it.id == vm.currentConvId }?.title ?: page.label
+                                    } else page.label
+                                    Text(title, fontWeight = FontWeight.Bold, fontSize = 18.sp, maxLines = 1)
                                 }
                             },
                             actions = {
@@ -218,6 +284,7 @@ fun AiWayApp(vm: AiWayViewModel = viewModel()) {
                         when (page) {
                             AppPage.Chat -> ChatScreen(vm)
                             AppPage.Files -> FilesScreen(vm)
+                            AppPage.Preview -> PreviewScreen(vm) { fixPrompt -> page = AppPage.Chat; vm.sendPrompt(fixPrompt) }
                             AppPage.Github -> GithubScreen(vm)
                             AppPage.Settings -> SettingsScreen(vm)
                         }
@@ -233,7 +300,8 @@ private fun AiWayDrawer(
     vm: AiWayViewModel,
     current: AppPage,
     onSelect: (AppPage) -> Unit,
-    onNewChat: () -> Unit
+    onNewChat: () -> Unit,
+    onOpen: (String) -> Unit
 ) {
     ModalDrawerSheet(
         drawerContainerColor = MaterialTheme.colorScheme.surface,
@@ -254,24 +322,39 @@ private fun AiWayDrawer(
             }
             Spacer(Modifier.height(18.dp))
             DrawerItem(Icons.Default.Folder, AppPage.Files, current, onSelect)
+            DrawerItem(Icons.Default.PlayArrow, AppPage.Preview, current, onSelect)
             DrawerItem(Icons.Default.Settings, AppPage.Settings, current, onSelect)
             DrawerItem(Icons.Default.Cloud, AppPage.Github, current, onSelect)
             Spacer(Modifier.height(18.dp))
-            Text("المحادثات الأخيرة", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+            Text("المحادثات المحفوظة", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
             Spacer(Modifier.height(8.dp))
-            val recent = vm.messages.filter { it.role == "user" }.takeLast(4).reversed()
-            if (recent.isEmpty()) {
+            if (vm.conversations.isEmpty()) {
                 Text("لا توجد محادثات بعد", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
+                Spacer(Modifier.weight(1f))
             } else {
-                recent.forEach { msg ->
-                    Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Chat, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(19.dp))
-                        Spacer(Modifier.width(10.dp))
-                        Text(msg.text, maxLines = 1, fontSize = 14.sp)
+                LazyColumn(Modifier.weight(1f)) {
+                    items(vm.conversations, key = { it.id }) { c ->
+                        val active = c.id == vm.currentConvId
+                        Surface(
+                            color = if (active) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp).clickable { onOpen(c.id) }
+                        ) {
+                            Row(Modifier.padding(start = 12.dp, top = 6.dp, bottom = 6.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Chat, null, tint = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(19.dp))
+                                Spacer(Modifier.width(10.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(c.title, maxLines = 1, fontSize = 14.sp, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal)
+                                    Text("${c.count} رسالة • ${relTime(c.updatedAt)}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                IconButton(onClick = { vm.deleteConversation(c.id) }, modifier = Modifier.size(36.dp)) {
+                                    Icon(Icons.Default.Delete, "حذف المحادثة", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+                                }
+                            }
+                        }
                     }
                 }
             }
-            Spacer(Modifier.weight(1f))
             HorizontalDivider()
             Row(Modifier.fillMaxWidth().padding(vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
                 Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(48.dp)) {
@@ -338,9 +421,14 @@ private fun CompactModelPicker(vm: AiWayViewModel) {
 private fun ChatScreen(vm: AiWayViewModel) {
     var prompt by remember { mutableStateOf("") }
     var toolsOpen by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+    LaunchedEffect(vm.messages.size, vm.messages.lastOrNull()?.text?.length, vm.lastRun) {
+        if (vm.messages.isNotEmpty()) listState.scrollToItem(vm.messages.size - 1 + (if (vm.lastRun != null) 1 else 0))
+    }
 
     Column(Modifier.fillMaxSize()) {
         LazyColumn(
+            state = listState,
             modifier = Modifier.weight(1f).fillMaxWidth(),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -349,8 +437,9 @@ private fun ChatScreen(vm: AiWayViewModel) {
                 item { WelcomePanel(onSuggestion = { prompt = it }) }
             }
             items(vm.messages, key = { it.id }) { m ->
-                MessageBubble(m)
+                MessageBubble(m, typing = vm.busy && m.id == vm.messages.lastOrNull()?.id)
             }
+            vm.lastRun?.let { run -> item(key = "changes") { ChangesCard(run, vm) } }
         }
 
         if (vm.agentActivity.isNotBlank()) {
@@ -374,7 +463,7 @@ private fun ChatScreen(vm: AiWayViewModel) {
                     minLines = 2,
                     maxLines = 5,
                     shape = RoundedCornerShape(22.dp),
-                    placeholder = { Text("اسأل AiWay أو صف ما تريد بناءه…") },
+                    placeholder = { Text(if (vm.agentMode == "plan") "صف ما تريد وسيضع AiWay خطة بدون تعديل الملفات…" else "اسأل AiWay أو صف ما تريد بناءه…") },
                     trailingIcon = {
                         FilledIconButton(
                             onClick = { val p = prompt; prompt = ""; vm.sendPrompt(p) },
@@ -384,6 +473,12 @@ private fun ChatScreen(vm: AiWayViewModel) {
                 )
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    FilterChip(
+                        selected = vm.agentMode == "plan",
+                        onClick = { vm.updateAgentMode(if (vm.agentMode == "plan") "build" else "plan") },
+                        label = { Text(if (vm.agentMode == "plan") "وضع: خطة" else "وضع: بناء", fontSize = 12.sp) }
+                    )
+                    Spacer(Modifier.width(8.dp))
                     OutlinedButton(onClick = { toolsOpen = true }, shape = RoundedCornerShape(14.dp)) {
                         Icon(Icons.Default.Build, null, modifier = Modifier.size(17.dp))
                         Spacer(Modifier.width(5.dp))
@@ -406,13 +501,21 @@ private fun ChatScreen(vm: AiWayViewModel) {
 @Composable
 private fun WelcomePanel(onSuggestion: (String) -> Unit) {
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(12.dp))
-        AiLogo()
-        Spacer(Modifier.height(22.dp))
-        Text("مرحباً، أنا AiWay", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
-        Spacer(Modifier.height(8.dp))
-        Text("من الفكرة إلى الكود. مساحة واحدة تفكر فيها، تبني، وتجرب ما تصنعه.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(26.dp))
+        Box(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(28.dp))
+                .background(Brush.verticalGradient(listOf(MaterialTheme.colorScheme.primaryContainer, MaterialTheme.colorScheme.background)))
+                .padding(vertical = 26.dp, horizontal = 18.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                AiLogo()
+                Spacer(Modifier.height(18.dp))
+                Text("مرحباً، أنا AiWay", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
+                Spacer(Modifier.height(8.dp))
+                Text("من الفكرة إلى الكود. مساحة واحدة تفكر فيها، تبني، وتجرب ما تصنعه.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        Spacer(Modifier.height(20.dp))
         SuggestionCard(Icons.Default.Edit, "ابنِ واجهة جديدة", "حوّل فكرتك إلى تجربة حقيقية", "ابنِ لي واجهة Android حديثة ومتجاوبة") { onSuggestion(it) }
         SuggestionCard(Icons.Default.Search, "راجع الكود وحسّنه", "اكتشف الأخطاء والفرص المخفية", "راجع ملفات المشروع وحسّن الجودة والأداء") { onSuggestion(it) }
         SuggestionCard(Icons.Default.Build, "أصلح مشكلة برمجية", "حلول واضحة بلا تعقيد", "افحص المشروع وابحث عن سبب المشكلة وأصلحها") { onSuggestion(it) }
@@ -442,18 +545,59 @@ private fun SuggestionCard(icon: androidx.compose.ui.graphics.vector.ImageVector
 }
 
 @Composable
-private fun MessageBubble(m: ChatMessage) {
+private fun TypingDots() {
+    val t = rememberInfiniteTransition(label = "typing")
+    Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 6.dp)) {
+        repeat(3) { i ->
+            val a by t.animateFloat(
+                initialValue = 0.25f, targetValue = 1f,
+                animationSpec = infiniteRepeatable(tween(600, delayMillis = i * 150), RepeatMode.Reverse),
+                label = "dot$i"
+            )
+            Box(Modifier.size(7.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = a)))
+        }
+    }
+}
+
+@Composable
+private fun MessageBubble(m: ChatMessage, typing: Boolean = false) {
     val user = m.role == "user"
+    val clipboard = LocalClipboardManager.current
+    val primary = MaterialTheme.colorScheme.primary
+    val bubbleShape = if (user) RoundedCornerShape(20.dp, 20.dp, 6.dp, 20.dp) else RoundedCornerShape(20.dp, 20.dp, 20.dp, 6.dp)
     Row(Modifier.fillMaxWidth(), horizontalArrangement = if (user) Arrangement.Start else Arrangement.End) {
-        Card(
-            modifier = Modifier.fillMaxWidth(if (user) .90f else .96f),
-            shape = RoundedCornerShape(18.dp),
-            colors = CardDefaults.cardColors(containerColor = if (user) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)
-        ) {
-            Column(Modifier.padding(14.dp)) {
-                Text(if (user) "أنت" else "AiWay", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-                Spacer(Modifier.height(5.dp))
-                SelectionContainer { Text(m.text.ifBlank { "…" }) }
+        if (user) {
+            Box(
+                Modifier.fillMaxWidth(.88f).clip(bubbleShape)
+                    .background(Brush.linearGradient(listOf(primary, Color(0xFF5B8DEF))))
+                    .padding(14.dp)
+            ) {
+                SelectionContainer { Text(m.text, color = Color.White) }
+            }
+        } else {
+            Card(
+                modifier = Modifier.fillMaxWidth(.97f),
+                shape = bubbleShape,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+            ) {
+                Column(Modifier.padding(14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(24.dp)) {
+                            Box(contentAlignment = Alignment.Center) { Text("A", fontWeight = FontWeight.ExtraBold, fontSize = 12.sp, color = primary) }
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text("AiWay", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = primary)
+                        Spacer(Modifier.weight(1f))
+                        if (m.text.isNotBlank()) {
+                            IconButton(onClick = { clipboard.setText(AnnotatedString(m.text)) }, modifier = Modifier.size(30.dp)) {
+                                Icon(Icons.Default.ContentCopy, "نسخ", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    if (m.text.isBlank() && typing) TypingDots() else SelectionContainer { Text(m.text.ifBlank { "…" }) }
+                }
             }
         }
     }
@@ -490,11 +634,18 @@ private fun ToolSwitch(title: String, subtitle: String, checked: Boolean, onChec
 @Composable
 private fun FilesScreen(vm: AiWayViewModel) {
     var newName by remember { mutableStateOf("") }
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri -> uri?.let { vm.exportZip(it) } }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { vm.importZip(it) } }
     Column(Modifier.fillMaxSize().padding(14.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("مساحة العمل", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
             AssistChip(onClick = {}, label = { Text("${vm.files.size} ملف") })
+            IconButton(onClick = { importLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) }) { Icon(Icons.Default.Upload, "استيراد ZIP") }
+            IconButton(onClick = { exportLauncher.launch("aiway-workspace.zip") }) { Icon(Icons.Default.Download, "تصدير ZIP") }
+        }
+        Row {
+            AssistChip(onClick = vm::createAgentsFile, label = { Text("AGENTS.md — قواعد المشروع للوكيل", fontSize = 12.sp) }, leadingIcon = { Icon(Icons.Default.Edit, null, Modifier.size(16.dp)) })
         }
         Spacer(Modifier.height(10.dp))
         Row(Modifier.fillMaxSize()) {
@@ -577,6 +728,8 @@ private fun GithubScreen(vm: AiWayViewModel) {
 private fun SettingsScreen(vm: AiWayViewModel) {
     val context = LocalContext.current
     var modelOpen by remember { mutableStateOf(false) }
+    var eventsOpen by remember { mutableStateOf(false) }
+    var confirmClear by remember { mutableStateOf(false) }
 
     fun openExternal(url: String) {
         runCatching {
@@ -668,6 +821,60 @@ private fun SettingsScreen(vm: AiWayViewModel) {
             }
         }
 
+        SettingsCard("الاتصال والشبكة") {
+            Text("يجرّب AiWay تلقائياً: DNS النظام ← DNS مشفّر (Cloudflare / Google / Quad9) ← آخر عناوين ناجحة ← إعادة المحاولة عند ضعف الشبكة.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = vm::runDiagnostics, enabled = !vm.checking, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                if (vm.checking) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp) else Icon(Icons.Default.NetworkCheck, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("فحص الاتصال")
+            }
+            vm.diagnostics.forEach { c ->
+                Row(Modifier.padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        if (c.ok) Icons.Default.CheckCircle else Icons.Default.Error, null,
+                        tint = if (c.ok) Color(0xFF22C55E) else MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text(c.label, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text(c.detail, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+        }
+
+        SettingsCard("التخزين المحلي") {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Storage, null, tint = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.width(10.dp))
+                Text("كل محادثاتك وإعداداتك وتعديلات ملفاتك وتسجيل الدخول محفوظة على هذا الجهاز.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(vm.storageInfo.ifBlank { "—" }, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { vm.refreshStorageInfo(); vm.loadEvents(); eventsOpen = true }, shape = RoundedCornerShape(14.dp)) {
+                    Icon(Icons.Default.History, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(5.dp)); Text("سجل النشاط")
+                }
+                OutlinedButton(onClick = { confirmClear = true }, shape = RoundedCornerShape(14.dp)) {
+                    Icon(Icons.Default.Delete, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(5.dp)); Text("مسح المحادثات")
+                }
+            }
+        }
+
+        if (eventsOpen) EventsDialog(vm) { eventsOpen = false }
+        if (confirmClear) {
+            AlertDialog(
+                onDismissRequest = { confirmClear = false },
+                title = { Text("مسح كل المحادثات؟") },
+                text = { Text("سيتم حذف كل المحادثات المحفوظة على هذا الجهاز. لن تتأثر ملفات المشروع ولا تسجيل الدخول.") },
+                confirmButton = { Button(onClick = { vm.clearAllConversations(); confirmClear = false }) { Text("مسح") } },
+                dismissButton = { OutlinedButton(onClick = { confirmClear = false }) { Text("إلغاء") } }
+            )
+        }
+
         SettingsCard("أدوات الوكيل") {
             ToolSwitch("قراءة ملفات المشروع", "قراءة قائمة الملفات ومحتواها", vm.toolRead, vm::updateToolRead)
             ToolSwitch("إنشاء وتعديل الملفات", "السماح للوكيل بتطبيق التعديلات", vm.toolWrite, vm::updateToolWrite)
@@ -675,6 +882,202 @@ private fun SettingsScreen(vm: AiWayViewModel) {
             ToolSwitch("البحث في الويب", "Hosted web_search عندما يدعمه الموديل والحساب", vm.toolWebSearch, vm::updateToolWebSearch)
         }
     }
+}
+
+@Composable
+private fun ChangesCard(run: RunChanges, vm: AiWayViewModel) {
+    var diffPath by remember { mutableStateOf<String?>(null) }
+    val added = run.changes.sumOf { it.added }
+    val removed = run.changes.sumOf { it.removed }
+    val green = Color(0xFF22C55E)
+    val red = Color(0xFFEF4444)
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = .5f))
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Edit, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("مراجعة التعديلات • ${run.changes.size} ملف", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Text("+$added", color = green, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Spacer(Modifier.width(8.dp))
+                Text("−$removed", color = red, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+            Spacer(Modifier.height(8.dp))
+            run.changes.forEach { c ->
+                val (label, color) = when (c.status) {
+                    FileChange.Status.Added -> "جديد" to green
+                    FileChange.Status.Deleted -> "محذوف" to red
+                    FileChange.Status.Modified -> "معدّل" to MaterialTheme.colorScheme.primary
+                }
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { diffPath = c.path }.padding(vertical = 7.dp, horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(shape = RoundedCornerShape(8.dp), color = color.copy(alpha = .15f)) {
+                        Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp))
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                        Text(c.path, fontFamily = FontFamily.Monospace, fontSize = 12.sp, maxLines = 1, modifier = Modifier.weight(1f, fill = false))
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Text("+${c.added} −${c.removed}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = vm::dismissRun, shape = RoundedCornerShape(14.dp)) {
+                    Icon(Icons.Default.Check, null, Modifier.size(18.dp)); Spacer(Modifier.width(5.dp)); Text("إبقاء")
+                }
+                OutlinedButton(onClick = vm::undoLastRun, shape = RoundedCornerShape(14.dp)) {
+                    Icon(Icons.Default.Undo, null, Modifier.size(18.dp)); Spacer(Modifier.width(5.dp)); Text("تراجع عن الكل")
+                }
+            }
+        }
+    }
+    diffPath?.let { path -> DiffDialog(run, path, vm) { diffPath = null } }
+}
+
+@Composable
+private fun DiffDialog(run: RunChanges, path: String, vm: AiWayViewModel, onDismiss: () -> Unit) {
+    val lines = remember(run, path) { DiffUtil.diff(run.before[path].orEmpty(), run.after[path].orEmpty()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(path, fontSize = 14.sp, fontFamily = FontFamily.Monospace) },
+        text = {
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                LazyColumn(Modifier.fillMaxWidth().height(380.dp)) {
+                    items(lines.size) { i ->
+                        val l = lines[i]
+                        val bg = when (l.kind) {
+                            '+' -> Color(0x3322C55E)
+                            '-' -> Color(0x33EF4444)
+                            else -> Color.Transparent
+                        }
+                        Text(
+                            "${l.kind} ${l.text}",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            modifier = Modifier.fillMaxWidth().background(bg).padding(horizontal = 6.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = { OutlinedButton(onClick = { vm.revertFile(path); onDismiss() }) { Text("تراجع عن هذا الملف") } },
+        dismissButton = { Button(onClick = onDismiss) { Text("إغلاق") } }
+    )
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+private fun PreviewScreen(vm: AiWayViewModel, onFix: (String) -> Unit) {
+    var reload by remember { mutableStateOf(0) }
+    val errors = remember { mutableStateListOf<String>() }
+    val html = remember(reload) { vm.previewHtml() }
+
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("معاينة مباشرة", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            IconButton(onClick = { errors.clear(); reload++ }) { Icon(Icons.Default.Refresh, "تحديث") }
+        }
+        if (html == null) {
+            Box(Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                Text("أضف ملف index.html في مساحة العمل (أو اطلب من الوكيل بناءه) لتظهر المعاينة هنا.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else {
+            AndroidView(
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.allowFileAccess = false
+                        settings.allowContentAccess = false
+                        webViewClient = WebViewClient()
+                        webChromeClient = object : WebChromeClient() {
+                            override fun onConsoleMessage(m: ConsoleMessage): Boolean {
+                                if (m.messageLevel() == ConsoleMessage.MessageLevel.ERROR) errors.add("${m.message()} (line ${m.lineNumber()})")
+                                return true
+                            }
+                        }
+                    }
+                },
+                update = { wv ->
+                    if (wv.tag != reload) {
+                        wv.tag = reload
+                        wv.loadDataWithBaseURL("https://aiway.local/", html, "text/html", "utf-8", null)
+                    }
+                }
+            )
+        }
+        if (errors.isNotEmpty()) {
+            Surface(color = MaterialTheme.colorScheme.errorContainer, modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(12.dp).navigationBarsPadding(), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Error, null, tint = MaterialTheme.colorScheme.error)
+                    Spacer(Modifier.width(8.dp))
+                    Text("${errors.size} خطأ في الـ Console", modifier = Modifier.weight(1f), fontSize = 13.sp)
+                    Button(
+                        onClick = { onFix("المعاينة تُظهر أخطاء JavaScript التالية، افحص الملفات وأصلحها:\n" + errors.takeLast(8).joinToString("\n")) },
+                        shape = RoundedCornerShape(12.dp)
+                    ) { Text("أصلحها بالوكيل") }
+                }
+            }
+        }
+    }
+}
+
+private fun eventLabel(type: String) = when (type) {
+    "login_start" -> "بدء تسجيل الدخول"
+    "login_ok" -> "تسجيل دخول ناجح"
+    "login_fail" -> "فشل تسجيل الدخول"
+    "logout" -> "تسجيل خروج"
+    "setting" -> "تغيير إعداد"
+    "file_edit" -> "تعديل ملف"
+    "file_add" -> "إضافة ملف"
+    "file_delete" -> "حذف ملف"
+    "conversation_deleted" -> "حذف محادثة"
+    "conversations_cleared" -> "مسح المحادثات"
+    "app_start" -> "فتح التطبيق"
+    "github_connect" -> "اتصال GitHub"
+    "github_token" -> "GitHub token"
+    "repo_loaded" -> "تحميل مستودع"
+    "repo_push" -> "Push إلى GitHub"
+    "agent_run" -> "تشغيل الوكيل"
+    "undo_run" -> "تراجع عن تعديلات الوكيل"
+    "export_zip" -> "تصدير ZIP"
+    "import_zip" -> "استيراد ZIP"
+    else -> type
+}
+
+@Composable
+private fun EventsDialog(vm: AiWayViewModel, onDismiss: () -> Unit) {
+    val fmt = remember { SimpleDateFormat("MM/dd HH:mm", Locale.US) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("سجل النشاط") },
+        text = {
+            if (vm.events.isEmpty()) Text("لا يوجد نشاط بعد", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else LazyColumn(Modifier.fillMaxWidth().height(380.dp)) {
+                items(vm.events.size) { i ->
+                    val e = vm.events[i]
+                    Column(Modifier.padding(vertical = 6.dp)) {
+                        Row {
+                            Text(eventLabel(e.second), fontWeight = FontWeight.SemiBold, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                            Text(fmt.format(Date(e.first)), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (e.third.isNotBlank()) Text(e.third, fontSize = 11.sp, maxLines = 2, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    HorizontalDivider()
+                }
+            }
+        },
+        confirmButton = { Button(onClick = onDismiss) { Text("تم") } }
+    )
 }
 
 @Composable

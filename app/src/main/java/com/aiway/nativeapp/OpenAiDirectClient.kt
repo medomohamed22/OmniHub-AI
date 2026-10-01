@@ -48,6 +48,9 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
         files: MutableMap<String, String>,
         prompt: String,
         tools: ToolOptions,
+        history: List<Pair<String, String>> = emptyList(),
+        mode: String = "build",
+        rules: String = "",
         onTextDelta: (String) -> Unit = {},
         onTool: (String) -> Unit = {}
     ): AgentResult = withContext(Dispatchers.IO) {
@@ -59,18 +62,30 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
             if (tools.webSearch) add("البحث في الويب")
         }.joinToString("، ").ifBlank { "بدون أدوات" }
 
-        val input = JSONArray().put(
+        val input = JSONArray()
+        history.takeLast(20).forEach { (role, text) ->
+            if (text.isNotBlank() && (role == "user" || role == "assistant")) {
+                input.put(JSONObject().put("role", role).put("content", text.take(6000)))
+            }
+        }
+        input.put(
             JSONObject()
                 .put("role", "user")
                 .put("content", "طلب المستخدم:\n$prompt\n\nمساحة العمل الحالية تحتوي ${files.size} ملف. الأدوات المسموح بها: $toolDescription. لا تفترض محتوى ملف قبل قراءته.")
         )
+        val modeText = if (mode == "plan")
+            " أنت الآن في وضع التخطيط: اقرأ وابحث فقط ولا تعدّل أو تحذف أي ملف. قدّم خطة مرقّمة واضحة بالملفات والخطوات، وانتظر موافقة المستخدم قبل التنفيذ."
+        else
+            " أنت في وضع البناء: نفّذ التعديلات مباشرة. فضّل edit_file للتعديلات الصغيرة بدل إعادة كتابة الملف كاملاً، واستخدم search_files لتحديد المواقع قبل القراءة."
+        val rulesText = if (rules.isNotBlank()) "\n\nقواعد المشروع (AGENTS.md):\n" + rules.take(6000) else ""
+        val instructions = "أنت AiWay، وكيل برمجة داخل تطبيق Android Native. نفّذ طلب المستخدم بدقة. استخدم أدوات workspace فقط حسب الصلاحيات المتاحة، اقرأ قبل التعديل، غيّر أقل قدر لازم، حافظ على قابلية البناء، ولا تحذف ملفات إلا عند الحاجة ومع وجود أداة الحذف. بعد الانتهاء اشرح باختصار ما فعلته بالعربية." + modeText + rulesText
         var changed = false
         var finalText = ""
 
         repeat(12) { round ->
             val payload = JSONObject()
                 .put("model", model)
-                .put("instructions", "أنت AiWay، وكيل برمجة داخل تطبيق Android Native. نفّذ طلب المستخدم بدقة. استخدم أدوات workspace فقط حسب الصلاحيات المتاحة، اقرأ قبل التعديل، غيّر أقل قدر لازم، حافظ على قابلية البناء، ولا تحذف ملفات إلا عند الحاجة ومع وجود أداة الحذف. بعد الانتهاء اشرح باختصار ما فعلته بالعربية.")
+                .put("instructions", instructions)
                 .put("input", input)
                 .put("parallel_tool_calls", false)
                 .put("store", false)
@@ -170,7 +185,17 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
                 .put("required", JSONArray().put(field)).put("additionalProperties", false))
             .put("strict", true)
 
+        fun fn(name: String, description: String, vararg fields: Pair<String, String>): JSONObject {
+            val props = JSONObject()
+            val req = JSONArray()
+            fields.forEach { (f, d) -> props.put(f, JSONObject().put("type", "string").put("description", d)); req.put(f) }
+            return JSONObject().put("type", "function").put("name", name).put("description", description)
+                .put("parameters", JSONObject().put("type", "object").put("properties", props).put("required", req).put("additionalProperties", false))
+                .put("strict", true)
+        }
+
         if (options.allowRead) {
+            workspaceTools.put(fn("search_files", "Case-insensitive text search across all workspace files. Returns path, line number and line text.", "query" to "Text to search for"))
             workspaceTools.put(noArgs("list_files", "List every file path and UTF-8 character count in the workspace."))
             workspaceTools.put(oneString("read_file", "Read one UTF-8 text file from the workspace.", "path", "Relative workspace path"))
         }
@@ -186,6 +211,11 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
                         .put("required", JSONArray().put("path").put("content")).put("additionalProperties", false))
                     .put("strict", true)
             )
+        }
+        if (options.allowWrite) {
+            workspaceTools.put(fn("edit_file", "Replace exactly one occurrence of old_str with new_str in a file. Fails if old_str is missing or not unique. Prefer this over write_file for small edits.",
+                "path" to "Relative workspace path", "old_str" to "Exact existing text (must appear once)", "new_str" to "Replacement text"))
+            workspaceTools.put(fn("move_file", "Move or rename a file inside the workspace.", "from" to "Existing relative path", "to" to "New relative path"))
         }
         if (options.allowDelete) {
             workspaceTools.put(oneString("delete_file", "Delete one file from the workspace.", "path", "Relative workspace path"))
@@ -225,6 +255,50 @@ class OpenAiDirectClient(private val http: OkHttpClient) {
                 val p = path(); val content = args.getString("content")
                 if (files[p] != content) { files[p] = content; markChanged() }
                 JSONObject().put("ok", true).put("path", p).put("characters", content.length).toString()
+            }
+            "search_files" -> if (!options.allowRead) denied(name) else {
+                val q = args.optString("query").trim()
+                require(q.isNotBlank()) { "query is empty" }
+                val hits = JSONArray()
+                outer@ for ((p, c) in files.entries.sortedBy { it.key }) {
+                    val ls = c.split('\n')
+                    for (i in ls.indices) {
+                        if (ls[i].contains(q, ignoreCase = true)) {
+                            hits.put(JSONObject().put("path", p).put("line", i + 1).put("text", ls[i].trim().take(200)))
+                            if (hits.length() >= 60) break@outer
+                        }
+                    }
+                }
+                JSONObject().put("ok", true).put("matches", hits).put("truncated", hits.length() >= 60).toString()
+            }
+            "edit_file" -> if (!options.allowWrite) denied(name) else {
+                val p = path()
+                val oldText = args.getString("old_str")
+                val replacement = args.getString("new_str")
+                val content = files[p] ?: return JSONObject().put("ok", false).put("error", "not_found").put("path", p).toString()
+                val first = if (oldText.isEmpty()) -1 else content.indexOf(oldText)
+                when {
+                    first < 0 -> JSONObject().put("ok", false).put("error", "old_str_not_found").toString()
+                    content.indexOf(oldText, first + oldText.length) >= 0 -> JSONObject().put("ok", false).put("error", "old_str_not_unique").toString()
+                    else -> {
+                        files[p] = content.substring(0, first) + replacement + content.substring(first + oldText.length)
+                        markChanged()
+                        JSONObject().put("ok", true).put("path", p).toString()
+                    }
+                }
+            }
+            "move_file" -> if (!options.allowWrite) denied(name) else {
+                fun norm(k: String): String {
+                    val v = args.optString(k).trim().replace('\\', '/')
+                    require(v.isNotBlank() && !v.startsWith('/') && !v.split('/').contains("..")) { "Invalid workspace path" }
+                    return v
+                }
+                val from = norm("from")
+                val to = norm("to")
+                val c = files[from] ?: return JSONObject().put("ok", false).put("error", "not_found").put("path", from).toString()
+                if (files.containsKey(to)) return JSONObject().put("ok", false).put("error", "destination_exists").toString()
+                files.remove(from); files[to] = c; markChanged()
+                JSONObject().put("ok", true).put("from", from).put("to", to).toString()
             }
             "delete_file" -> if (!options.allowDelete) denied(name) else {
                 val p = path(); val existed = files.remove(p) != null

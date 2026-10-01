@@ -19,6 +19,7 @@ import java.io.OutputStreamWriter
 import java.math.BigInteger
 import java.net.InetAddress
 import java.net.ServerSocket
+import java.net.Socket
 import java.net.URLDecoder
 import java.security.KeyFactory
 import java.security.MessageDigest
@@ -66,8 +67,27 @@ class OpenAiAuthManager(
 
     fun currentSession(): Session? = loadSession()
 
-    suspend fun signIn(openBrowser: (String) -> Unit): Session = withContext(Dispatchers.IO) {
+    suspend fun signIn(openBrowser: (String) -> Unit): Session {
+        // Keep the app process alive while the user is inside Chrome Custom Tab.
+        // Without this, Android/OEM battery managers freeze the app and the local
+        // callback server never answers -> OpenAI page spins forever.
+        AuthKeepAliveService.start(context)
+        try {
+            return signInInternal(openBrowser)
+        } finally {
+            AuthKeepAliveService.stop(context)
+        }
+    }
+
+    private suspend fun signInInternal(openBrowser: (String) -> Unit): Session = withContext(Dispatchers.IO) {
         val existing = loadSession()
+        // A dynamic client registration can succeed even when the one-time
+        // authorization code later expires/fails. Persist the issued client ID
+        // independently from the token session so the next attempt can
+        // reauthorize the already-registered client instead of starting over.
+        val savedRegisteredClientId = secure.get("openai_registered_client_id")
+            .takeIf { it.isNotBlank() && it != "dynamic_agent_client" }
+            ?: existing?.clientId?.takeIf { it.isNotBlank() }
         var retryClientId: String? = null
         var lastInvalidGrant: Throwable? = null
 
@@ -83,19 +103,22 @@ class OpenAiAuthManager(
             val listener = LoopbackListener()
             val redirectUri = "http://127.0.0.1:${listener.port}/auth/callback"
 
-            val initial = retryClientId == null && existing?.clientId.isNullOrBlank()
-            val requestClientId = retryClientId
-                ?: if (initial) "dynamic_agent_client" else existing!!.clientId
+            val registeredClientId = retryClientId ?: savedRegisteredClientId
+            val initial = registeredClientId.isNullOrBlank()
+            val requestClientId = if (initial) "dynamic_agent_client" else registeredClientId!!
 
             val uri = Uri.parse(authEndpoint).buildUpon()
                 .appendQueryParameter("client_id", requestClientId)
                 .apply {
                     if (initial) appendQueryParameter("agent_name_hint", "AiWay")
                     appendQueryParameter("ext_agent_host_id", hostId)
-                    if (!initial && existing != null && existing.idToken.isNotBlank()) {
+                    // Only send identity hints when they belong to the same saved
+                    // registration. A persisted registration without tokens is still
+                    // valid for reauthorization, but has no safe identity hint yet.
+                    if (!initial && existing != null && existing.clientId == requestClientId && existing.idToken.isNotBlank()) {
                         appendQueryParameter("id_token_hint", existing.idToken)
                     }
-                    if (!initial && existing != null && existing.email.isNotBlank()) {
+                    if (!initial && existing != null && existing.clientId == requestClientId && existing.email.isNotBlank()) {
                         appendQueryParameter("login_hint", existing.email)
                     }
                 }
@@ -128,6 +151,11 @@ class OpenAiAuthManager(
             if (!initial && callback["client_id"].orEmpty().isNotBlank() && callback["client_id"] != issuedClientId) {
                 error("OpenAI returned a different client_id")
             }
+
+            // IMPORTANT: persist registration BEFORE code exchange. Authorization
+            // codes are one-time and short-lived; if exchange returns invalid_grant
+            // or Android kills/restarts the UI, the issued client remains reusable.
+            secure.put("openai_registered_client_id", issuedClientId)
 
             val tokenJson = try {
                 postToken(
@@ -176,6 +204,7 @@ class OpenAiAuthManager(
                 error("تم اختيار حساب ChatGPT مختلف. سجل الخروج أولاً لإضافة حساب آخر")
             }
 
+            secure.put("openai_registered_client_id", issuedClientId)
             saveSession(session)
             return@withContext session
         }
@@ -325,64 +354,70 @@ class OpenAiAuthManager(
         val port: Int get() = server.localPort
         private val result = CompletableDeferred<Map<String, String>>()
 
-        private val worker = Thread {
-            try {
-                while (!result.isCompleted && !server.isClosed) {
-                    val socket = server.accept()
-                    socket.soTimeout = 5_000
-                    socket.use {
-                        val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-                        val first = reader.readLine().orEmpty()
-                        val target = first.split(' ').getOrNull(1).orEmpty()
-                        // Drain request headers so Chromium does not keep the request pending.
-                        while (true) {
-                            val line = reader.readLine() ?: break
-                            if (line.isBlank()) break
-                        }
-
-                        val uri = runCatching { Uri.parse("http://127.0.0.1$target") }.getOrNull()
-                        val isCallback = uri?.path == "/auth/callback"
-                        val params = linkedMapOf<String, String>()
-                        if (isCallback && uri != null) {
-                            uri.queryParameterNames.forEach { name ->
-                                params[name] = uri.getQueryParameter(name).orEmpty()
-                            }
-                        }
-
-                        val body = if (isCallback) {
-                            """<!doctype html><html dir='rtl'><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta charset='utf-8'><title>AiWay</title></head><body style='margin:0;background:#f7f9ff;font-family:Arial,sans-serif;color:#172033;display:flex;min-height:100vh;align-items:center;justify-content:center'><div style='max-width:420px;padding:28px;text-align:center'><div style='width:72px;height:72px;border-radius:22px;background:#2f6fed;color:white;margin:0 auto 18px;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700'>A</div><h2>تم ربط ChatGPT بـ AiWay</h2><p style='color:#667085;line-height:1.7'>تم استلام تسجيل الدخول بنجاح. سيتم الرجوع إلى تطبيق AiWay تلقائياً.</p><p><a href='aiway://oauth-complete' style='display:inline-block;background:#2f6fed;color:white;padding:12px 22px;border-radius:14px;text-decoration:none'>العودة إلى AiWay</a></p><script>setTimeout(function(){location.href='aiway://oauth-complete'},700)</script></div></body></html>"""
-                        } else {
-                            """<!doctype html><html><body>AiWay OAuth listener is running.</body></html>"""
-                        }
-                        val bytes = body.toByteArray(Charsets.UTF_8)
-                        val out = socket.getOutputStream()
-                        val status = if (isCallback) "200 OK" else "204 No Content"
-                        out.write(("HTTP/1.1 $status\r\n" +
-                            "Content-Type: text/html; charset=utf-8\r\n" +
-                            "Cache-Control: no-store\r\n" +
-                            "Content-Length: ${bytes.size}\r\n" +
-                            "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII))
-                        if (isCallback) out.write(bytes)
-                        out.flush()
-
-                        if (isCallback) result.complete(params)
-                    }
+        // Accept loop only accepts. Every connection is handled on its own thread, so an
+        // idle Chromium preconnect socket can never block (or kill) the real callback.
+        private val acceptor = Thread {
+            while (!result.isCompleted && !server.isClosed) {
+                val socket = try { server.accept() } catch (t: Throwable) { break }
+                Thread { handle(socket) }.apply {
+                    isDaemon = true
+                    name = "aiway-oauth-conn"
+                    start()
                 }
-            } catch (t: Throwable) {
-                if (!result.isCompleted && !server.isClosed) result.completeExceptionally(t)
             }
         }.apply {
             isDaemon = true
-            name = "aiway-oauth-loopback"
+            name = "aiway-oauth-accept"
             start()
+        }
+
+        private fun handle(socket: Socket) {
+            try {
+                socket.soTimeout = 15_000
+                socket.use {
+                    val reader = BufferedReader(InputStreamReader(it.getInputStream(), Charsets.UTF_8))
+                    val first = reader.readLine() ?: return   // idle/preconnect socket: just drop it
+                    val target = first.split(' ').getOrNull(1).orEmpty()
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (line.isBlank()) break
+                    }
+
+                    val uri = runCatching { Uri.parse("http://127.0.0.1$target") }.getOrNull()
+                    val isCallback = uri?.path == "/auth/callback"
+                    val params = linkedMapOf<String, String>()
+                    if (isCallback && uri != null) {
+                        uri.queryParameterNames.forEach { name ->
+                            params[name] = uri.getQueryParameter(name).orEmpty()
+                        }
+                    }
+                    val isRealCallback = isCallback && (params.containsKey("code") || params.containsKey("error"))
+
+                    val body = if (isRealCallback) SUCCESS_HTML else "<!doctype html><html><body>AiWay OAuth listener is running.</body></html>"
+                    val bytes = body.toByteArray(Charsets.UTF_8)
+                    val out = it.getOutputStream()
+                    out.write(("HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: text/html; charset=utf-8\r\n" +
+                        "Cache-Control: no-store\r\n" +
+                        "Content-Length: ${bytes.size}\r\n" +
+                        "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII))
+                    out.write(bytes)
+                    out.flush()
+
+                    if (isRealCallback) result.complete(params)
+                }
+            } catch (_: Throwable) {
+                // Idle / reset / timed-out sockets are normal with Chromium. Ignore them.
+            }
         }
 
         suspend fun await(): Map<String, String> = result.await()
         fun close() { runCatching { server.close() } }
 
         companion object {
+            private const val SUCCESS_HTML = """<!doctype html><html dir='rtl'><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta charset='utf-8'><title>AiWay</title></head><body style='margin:0;background:#f7f9ff;font-family:Arial,sans-serif;color:#172033;display:flex;min-height:100vh;align-items:center;justify-content:center'><div style='max-width:420px;padding:28px;text-align:center'><div style='width:72px;height:72px;border-radius:22px;background:#2f6fed;color:white;margin:0 auto 18px;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:700'>A</div><h2>تم ربط ChatGPT بـ AiWay</h2><p style='color:#667085;line-height:1.7'>تم استلام تسجيل الدخول بنجاح. سيتم الرجوع إلى تطبيق AiWay تلقائياً.</p><p><a href='aiway://oauth-complete' style='display:inline-block;background:#2f6fed;color:white;padding:12px 22px;border-radius:14px;text-decoration:none'>العودة إلى AiWay</a></p><script>setTimeout(function(){location.href='aiway://oauth-complete'},700)</script></div></body></html>"""
+
             private fun openServer(): ServerSocket {
-                // Prefer the documented example port on mobile; fall back to an ephemeral port if occupied.
                 return runCatching { ServerSocket(1455, 16, InetAddress.getByName("127.0.0.1")) }
                     .getOrElse { ServerSocket(0, 16, InetAddress.getByName("127.0.0.1")) }
             }
